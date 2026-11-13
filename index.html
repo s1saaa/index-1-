@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Light show</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>if (!window.Peer) document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"><\/script>');</script>
+<script>if (!window.Peer) document.write('<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"><\/script>');</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  :root { --bg:#14101a; --fg:#f3ecf6; --dim:#9b90a6; --pink:#F4C2C2; --line:#3a3144; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:16px/1.5 Georgia,"Times New Roman",serif; }
+  button,input { font:inherit; }
+  button { background:var(--pink); color:#2a1620; border:0; border-radius:999px;
+    padding:.7em 1.4em; cursor:pointer; }
+  button:focus-visible,input:focus-visible { outline:3px solid #fff; outline-offset:2px; }
+  .hidden { display:none !important; }
+
+  /* phone */
+  #light { position:fixed; inset:0; background:var(--pink); opacity:0; pointer-events:none; }
+  #fx { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; }
+  #gate { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:1.2rem; text-align:center; padding:2rem; }
+  #gate button { font-size:1.5rem; padding:1em 2em; }
+  #status { color:var(--dim); margin:0; }
+
+  /* coordinator */
+  main { max-width:760px; margin:0 auto; padding:2rem 1.2rem 4rem; display:grid; gap:1.6rem; }
+  h1 { font-weight:400; font-size:2rem; margin:0; }
+  .row { display:flex; gap:1.5rem; align-items:center; flex-wrap:wrap; }
+  #qr { background:#fff; padding:8px; border-radius:8px; min-width:100px; min-height:100px; }
+  #link { word-break:break-all; color:var(--dim); font-size:.9rem; }
+  video { width:100%; max-height:50vh; background:#000; border-radius:8px; }
+  input[type=number] { width:6em; background:#1f1827; color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:.3em .5em; }
+  .count { font-size:2.4rem; line-height:1; }
+  #preview { width:96px; height:96px; border-radius:12px; border:1px solid var(--line); background:#000; overflow:hidden; position:relative; }
+  #preview.big { position:fixed; z-index:20; left:50%; top:50%; transform:translate(-50%,-50%);
+    height:86vh; width:calc(86vh * 9 / 19.5); border-radius:28px; border:2px solid #6b5f78;
+    box-shadow:0 0 0 100vmax rgba(5,3,8,.94); cursor:pointer; }
+  #pvhint { position:fixed; z-index:21; bottom:1rem; left:0; right:0; text-align:center; color:var(--dim); font-size:.9rem; }
+  #preview i { position:absolute; inset:0; background:var(--pink); opacity:0; }
+</style>
+</head>
+<body>
+
+<!-- PHONE VIEW -->
+<div id="phone" class="hidden">
+  <canvas id="fx" class="hidden"></canvas>
+  <div id="light"></div>
+  <div id="gate">
+    <p id="status">Connecting…</p>
+    <button id="go" disabled>Go fullscreen</button>
+    <p style="color:var(--dim);max-width:22em">Tap once to join. Keep this screen on until the show ends.</p>
+  </div>
+</div>
+
+<!-- COORDINATOR VIEW -->
+<main id="coord" class="hidden">
+  <h1>Light show coordinator</h1>
+  <div class="row">
+    <div id="qr"></div>
+    <div>
+      <div class="count"><span id="n">0</span> phones</div>
+      <div id="link"></div>
+    </div>
+  </div>
+  <div class="row">
+    <input id="file" type="file" accept="audio/*,video/*">
+    <button id="test">Flash all phones</button>
+    <button id="pvbtn">Preview on desktop</button>
+    <label>Light delay (ms) <input id="delay" type="number" value="0" step="10"></label>
+  </div>
+  <div class="row">
+    <div id="preview" title="Preview of what the phones show"></div>
+    <span id="songnote" style="color:var(--dim)">Loading song.mp3… or choose a file above.</span>
+  </div>
+  <video id="media" controls playsinline></video>
+  <div id="pvhint" class="hidden">Space plays or pauses. Esc or a click closes the preview.</div>
+</main>
+
+<script>
+/* ---------- Settings (edit here; coordinator sends these to every phone) ---------- */
+const CONFIG = {
+  cues: [
+    [10.255, 12.385], [12.980, 14.935], [15.562, 17.519],
+    [18.145, 19.220], [19.433, 19.970], [20.715, 22.699],
+    [23.304, 25.260], [25.885, 27.840], [28.466, 29.745]
+  ].map(([start, end]) => ({ start, end })),
+  color: '#F4C2C2',   // baby pink
+  peakMs: 50,         // full brightness
+  fadeMs: 1950,       // then fade to black
+  vibrate: true,
+  effects: [{ type: 'disco', start: 58, end: 73 }]   // 0:58 to 1:13
+};
+const PREFIX = 'pinkshow-';
+
+/* ---------- Disco ball: identical on every phone because it is a pure function of media time ---------- */
+const DISCO = (() => {
+  let s = 20261113;                                   // seeded random so all phones draw the same spots
+  const rnd = () => { s |= 0; s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  const palette = ['#F4C2C2', '#ffffff', '#ffd1e6', '#d9c2ff', '#bfe9ff'];
+  return Array.from({ length: 110 }, (_, i) => ({
+    r: 0.14 + rnd() * 0.9, a: rnd() * 6.2832, size: 0.6 + rnd() * 1.2,
+    ph: rnd() * 6.2832, color: palette[i % palette.length]
+  }));
+})();
+
+// t = seconds since the effect began, dur = effect length. Draws on a canvas of size w x h.
+function drawDisco(ctx, w, h, t, dur) {
+  const cx = w / 2, cy = h / 2, m = Math.min(w, h), maxR = Math.hypot(w, h) / 2;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#0a0610'; ctx.fillRect(0, 0, w, h);
+  ctx.canvas.style.opacity = Math.max(0, Math.min(1, t / 0.6, (dur - t) / 0.6));
+
+  // light spots thrown by the ball, sweeping around the room
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of DISCO) {
+    const a = p.a + t * 0.45, R = p.r * maxR * (1 + 0.03 * Math.sin(t * 2 + p.ph));
+    const x = cx + Math.cos(a) * R, y = cy + Math.sin(a) * R;
+    const sz = m * (0.02 + 0.03 * p.r) * p.size;
+    const tw = 0.35 + 0.65 * Math.max(0, Math.sin(t * 7 + p.ph));
+    ctx.fillStyle = p.color;
+    ctx.globalAlpha = 0.18 * tw; ctx.beginPath(); ctx.arc(x, y, sz * 2.2, 0, 6.2832); ctx.fill();   // glow
+    ctx.globalAlpha = 0.9 * tw; ctx.save(); ctx.translate(x, y); ctx.rotate(a);
+    ctx.fillRect(-sz / 2, -sz / 2, sz, sz); ctx.restore();                                         // mirror tile reflection
+  }
+
+  // the ball itself, tiles rotating around its axis
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  const br = m * 0.12, g = ctx.createRadialGradient(cx - br * .3, cy - br * .3, br * .1, cx, cy, br);
+  g.addColorStop(0, '#6d6477'); g.addColorStop(1, '#1d1726');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, br, 0, 6.2832); ctx.fill();
+  const ts = br * 0.2;
+  for (let la = -4; la <= 4; la++) {
+    const lat = la * 0.3, ring = Math.cos(lat), n = 14;
+    for (let k = 0; k < n; k++) {
+      const lon = (k / n) * 6.2832 + t * 0.9, depth = Math.cos(lon);
+      if (depth <= 0.05) continue;
+      const x = cx + br * ring * Math.sin(lon), y = cy + br * Math.sin(lat);
+      ctx.globalAlpha = depth * (0.25 + 0.75 * Math.max(0, Math.sin(t * 9 + k * 1.7 + la * 2.3)));
+      ctx.fillStyle = '#ffeaf3'; ctx.fillRect(x - ts / 2, y - ts / 2, ts * (0.4 + 0.6 * depth), ts);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+function activeEffect(effects, t) {
+  return effects.find(e => t >= e.start && t < e.end);
+}
+const now = () => performance.timeOrigin + performance.now();   // sub-ms wall clock
+const room = new URLSearchParams(location.search).get('room');
+
+if (!window.Peer) {
+  document.body.innerHTML = '<p style="padding:2rem">Could not load PeerJS from any CDN. Check your internet connection or ad blocker, then reload.</p>';
+} else {
+  room ? startPhone(room) : startCoordinator();
+}
+
+/* ====================== COORDINATOR ====================== */
+function startCoordinator() {
+  document.getElementById('coord').classList.remove('hidden');
+  const media = document.getElementById('media');
+  const conns = new Set();
+  let peer, code;
+
+  function open() {
+    code = Math.random().toString(36).slice(2, 7);
+    peer = new Peer(PREFIX + code);
+    peer.on('error', e => { if (e.type === 'unavailable-id') open(); else console.error(e); });
+    peer.on('open', () => {
+      const url = location.origin + location.pathname + '?room=' + code;
+      document.getElementById('link').textContent = url;
+      if (window.QRCode) new QRCode(document.getElementById('qr'), { text: url, width: 180, height: 180 });
+      else document.getElementById('qr').classList.add('hidden');
+    });
+    peer.on('connection', c => {
+      c.on('open', () => {
+        conns.add(c); count();
+        c.send({ type: 'config', config: CONFIG });
+        c.send(stateMsg());
+      });
+      c.on('data', m => {                       // clock sync: reply with our clock
+        if (m.type === 'ping') c.send({ type: 'pong', c: m.c, s: now() });
+      });
+      c.on('close', () => { conns.delete(c); count(); });
+      c.on('error', () => { conns.delete(c); count(); });
+    });
+  }
+
+  const count = () => document.getElementById('n').textContent = conns.size;
+  const broadcast = m => conns.forEach(c => c.open && c.send(m));
+  const delay = () => +document.getElementById('delay').value || 0;
+
+  // t0 = coordinator clock time at which media position 0 would occur
+  function stateMsg() {
+    const playing = !media.paused && !media.ended;
+    return { type: 'state', playing, t0: now() - media.currentTime * 1000, delay: delay() };
+  }
+  ['play', 'playing', 'pause', 'seeked', 'ended', 'ratechange']
+    .forEach(ev => media.addEventListener(ev, () => broadcast(stateMsg())));
+  document.getElementById('delay').addEventListener('input', () => broadcast(stateMsg()));
+  // local preview swatch: same flash as the phones, driven by the player's own clock
+  const pv = document.getElementById('preview');
+  pv.innerHTML = '<canvas width="120" height="120" style="position:absolute;inset:0;width:100%;height:100%"></canvas><i></i>';
+  const pvc = pv.firstChild.getContext('2d');
+  const fitPv = () => { const r = pv.getBoundingClientRect(); pv.firstChild.width = Math.round(r.width * 0.8); pv.firstChild.height = Math.round(r.height * 0.8); };
+  fitPv(); addEventListener('resize', fitPv);
+  const togglePv = on => {
+    pv.classList.toggle('big', on);
+    document.getElementById('pvhint').classList.toggle('hidden', !on);
+    fitPv();
+  };
+  document.getElementById('pvbtn').onclick = () => togglePv(true);
+  pv.onclick = () => { if (pv.classList.contains('big')) togglePv(false); };
+  addEventListener('keydown', e => {
+    if (!pv.classList.contains('big')) return;
+    if (e.key === 'Escape') togglePv(false);
+    if (e.key === ' ') { e.preventDefault(); media.paused ? media.play() : media.pause(); }
+  });
+  pv.firstChild.style.display = 'none';
+  let pvAnim = null;
+  const pvFlash = () => {
+    if (pvAnim) pvAnim.cancel();
+    const total = CONFIG.peakMs + CONFIG.fadeMs;
+    pvAnim = pv.querySelector('i').animate(
+      [{ opacity: 1, offset: 0 }, { opacity: 1, offset: CONFIG.peakMs / total }, { opacity: 0, offset: 1 }],
+      { duration: total, easing: 'linear', fill: 'forwards' });
+  };
+  let last = 0;
+  (function pvLoop() {
+    const t = media.currentTime - delay() / 1000;
+    const ef = !media.paused && activeEffect(CONFIG.effects, t);
+    if (ef) { pv.firstChild.style.display = ''; drawDisco(pvc, pv.firstChild.width, pv.firstChild.height, t - ef.start, ef.end - ef.start); }
+    else pv.firstChild.style.display = 'none';
+    if (!media.paused && t >= last) CONFIG.cues.forEach(c => { if (c.start > last && c.start <= t) pvFlash(); });
+    last = t;
+    requestAnimationFrame(pvLoop);
+  })();
+
+  document.getElementById('test').onclick = () => { pvFlash(); broadcast({ type: 'flash' }); };
+  document.getElementById('file').onchange = e => {
+    const f = e.target.files[0];
+    if (f) { media.src = URL.createObjectURL(f); document.getElementById('songnote').textContent = f.name; }
+  };
+
+  // default: the song bundled next to index.html
+  media.addEventListener('loadedmetadata', () => {
+    if (!media.src.startsWith('blob:')) document.getElementById('songnote').textContent = 'Song loaded: song.mp3';
+  });
+  media.addEventListener('error', () => {
+    document.getElementById('songnote').textContent = 'song.mp3 not found. Choose a file above.';
+  });
+  media.src = 'song.mp3';
+  open();
+}
+
+/* ====================== PHONE ====================== */
+function startPhone(code) {
+  document.getElementById('phone').classList.remove('hidden');
+  const lightEl = document.getElementById('light');
+  const gate = document.getElementById('gate');
+  const statusEl = document.getElementById('status');
+  const goBtn = document.getElementById('go');
+
+  let cfg = CONFIG;                  // replaced by coordinator's config on connect
+  let offset = 0, bestRtt = Infinity;  // coordinator clock ≈ local clock + offset
+  let state = { playing: false, t0: 0, delay: 0 };
+  let idx = 0, anim = null, conn = null, pingTimer = null, wake = null;
+
+  lightEl.style.background = cfg.color;
+
+  /* --- light: sudden full brightness, hold, fade. A new flash cancels the old fade. --- */
+  function flash() {
+    if (anim) anim.cancel();
+    const total = cfg.peakMs + cfg.fadeMs;
+    anim = lightEl.animate(
+      [{ opacity: 1, offset: 0 }, { opacity: 1, offset: cfg.peakMs / total }, { opacity: 0, offset: 1 }],
+      { duration: total, easing: 'linear', fill: 'forwards' }
+    );
+  }
+
+  /* --- media position, derived from the coordinator's clock --- */
+  const mediaTime = () => (now() + offset - state.t0 - state.delay) / 1000;
+  const seekIndex = () => { const t = mediaTime(); idx = cfg.cues.findIndex(c => c.start > t); if (idx < 0) idx = cfg.cues.length; };
+
+  const fx = document.getElementById('fx'), fctx = fx.getContext('2d');
+  let fxOn = false;
+  const fitFx = () => { fx.width = Math.round(innerWidth * 0.6); fx.height = Math.round(innerHeight * 0.6); };  // lower res = smooth on old phones
+  addEventListener('resize', fitFx); fitFx();
+
+  function tick() {
+    const tm = state.playing ? mediaTime() : -1;
+    const ef = state.playing && cfg.effects ? activeEffect(cfg.effects, tm) : null;
+    if (ef) {
+      if (!fxOn) { fx.classList.remove('hidden'); fxOn = true; }
+      drawDisco(fctx, fx.width, fx.height, tm - ef.start, ef.end - ef.start);
+    } else if (fxOn) { fx.classList.add('hidden'); fxOn = false; }
+
+    if (state.playing) {
+      const t = tm;
+      while (idx < cfg.cues.length && t >= cfg.cues[idx].start) {
+        const c = cfg.cues[idx++];
+        if (t - c.start < 0.3) {                        // skip stale cues (tab was frozen)
+          flash();
+          if (cfg.vibrate && navigator.vibrate) navigator.vibrate(Math.max(1, (c.end - t) * 1000));
+        }
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  /* --- connection + clock sync (NTP-style, keep the lowest-RTT sample) --- */
+  const peer = new Peer();
+  peer.on('open', connect);
+  peer.on('error', () => setTimeout(connect, 2000));
+
+  function connect() {
+    statusEl.textContent = 'Connecting…';
+    conn = peer.connect(PREFIX + code, { reliable: true });
+    conn.on('open', () => {
+      statusEl.textContent = 'Connected. Waiting for the show…';
+      goBtn.disabled = false;
+      bestRtt = Infinity;
+      let n = 0;
+      clearInterval(pingTimer);
+      pingTimer = setInterval(() => {
+        conn.open && conn.send({ type: 'ping', c: now() });
+        if (++n === 20) { clearInterval(pingTimer); pingTimer = setInterval(() => conn.open && conn.send({ type: 'ping', c: now() }), 5000); }
+      }, n < 20 ? 150 : 5000);
+    });
+    conn.on('data', m => {
+      if (m.type === 'config') { cfg = m.config; lightEl.style.background = cfg.color; }
+      else if (m.type === 'state') { state = m; seekIndex(); if (!m.playing && navigator.vibrate) navigator.vibrate(0); }
+      else if (m.type === 'flash') flash();
+      else if (m.type === 'pong') {
+        const t = now(), rtt = t - m.c;
+        if (rtt < bestRtt * 1.5 + 2) {               // accept good samples, smooth slightly
+          const o = m.s + rtt / 2 - t;
+          offset = rtt <= bestRtt ? o : offset * 0.8 + o * 0.2;
+          bestRtt = Math.min(bestRtt, rtt);
+          statusEl.textContent = 'Connected (sync ±' + Math.round(bestRtt / 2) + ' ms). Waiting for the show…';
+        }
+      }
+    });
+    const retry = () => { goBtn.disabled = true; statusEl.textContent = 'Reconnecting…'; setTimeout(connect, 2000); };
+    conn.on('close', retry);
+    conn.on('error', retry);
+  }
+
+  /* --- user gesture: fullscreen, unlock vibration, keep the screen awake --- */
+  goBtn.onclick = async () => {
+    if (navigator.vibrate) navigator.vibrate(1);      // user activation unlocks later vibrations
+    try { await document.documentElement.requestFullscreen({ navigationUI: 'hide' }); } catch (e) {}
+    try { wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+    gate.classList.add('hidden');
+  };
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement) gate.classList.remove('hidden');
+  });
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && wake) { try { wake = await navigator.wakeLock.request('screen'); } catch (e) {} }
+  });
+}
+</script>
+</body>
+</html>
